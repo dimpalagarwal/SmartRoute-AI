@@ -13,6 +13,12 @@ export default defineConfig({
       '/traffic': 'http://localhost:5001',
       '/traffic-flow': 'http://localhost:5001',
       '/driver': 'http://localhost:5001',
+      '/ai-risk': 'http://localhost:5001',
+      '/simulate-disruption': 'http://localhost:5001',
+      '/active-disruption': 'http://localhost:5001',
+      '/smart-reroute': 'http://localhost:5001',
+      '/reroute-vehicle': 'http://localhost:5001',
+      '/route-traffic-summary': 'http://localhost:5001',
     },
   },
 })

@@ -211,25 +211,40 @@ body {
   color: var(--text);
 }
 
+/* ── FIXED: vehicle-card uses flex so content stacks vertically ── */
 .vehicle-card {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: #fff;
-  display: grid;
-  grid-template-columns: 4px minmax(0, 1fr);
+  display: flex;
+  flex-direction: row;
   gap: 10px;
   padding: 10px;
 }
 
-.vehicle-stripe { border-radius: 999px; }
+.vehicle-stripe {
+  border-radius: 999px;
+  width: 4px;
+  flex-shrink: 0;
+  align-self: stretch;
+}
+
+/* ── NEW: wrapper so all content stacks in a column ── */
+.vehicle-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
 
 .vehicle-actions {
-  grid-column: 2 / -1;
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
   align-content: start;
 }
+
 .vehicle-actions .pill-btn {
   min-width: 132px;
 }
@@ -799,6 +814,14 @@ export default function App() {
 const [allRouteCoords, setAllRouteCoords] = useState([]);
 const [routeHoverInfo, setRouteHoverInfo] = useState(null);
 const [page, setPage] = useState("landing");
+const [driverDisruptions, setDriverDisruptions] = useState({});
+const [reroutingDrivers, setReroutingDrivers] = useState({});
+const [rerouteResults, setRerouteResults] = useState({});
+const [rerouteComparisons, setRerouteComparisons] = useState({}); // vehicleId -> [{routeIndex, distKm, durMin, riskLevel, riskReasons}]
+  const [notifOpen, setNotifOpen]       = useState(false);
+  const [notifs, setNotifs]             = useState([]); // {id,msg,type,ts,read}
+  const [stopETAs, setStopETAs]         = useState({}); // vehicleId -> [{stopId,name,etaMs,distKm}]
+  const [trafficAlertsFired, setTrafficAlertsFired] = useState(new Set()); // prevent duplicate alerts
   const [vehicles, setVehicles] = useState([
     {
       id: createId(),
@@ -1114,12 +1137,32 @@ const [page, setPage] = useState("landing");
     setIsSimulationStarted(true);
     setIsPlaying(true);
     setFitToken((prev) => prev + 1);
+
+    // ── Compute ETAs for every vehicle's stops ──────────────────────────────
+    const now = Date.now();
+    const newETAs = {};
+    vehicles.forEach((vehicle) => {
+      const state = nextStates[vehicle.id];
+      if (!state?.path?.length || !state.orderedStopIds?.length) return;
+      const vehicleStops = assignedStopsByVehicle[vehicle.id] || [];
+      newETAs[vehicle.id] = calcStopETAs(vehicle.id, state.path, state.orderedStopIds, vehicleStops, now);
+    });
+    setStopETAs(newETAs);
+
+    // ── Fire TomTom congestion check for each vehicle ───────────────────────
+    setTrafficAlertsFired(new Set()); // reset so new route gets fresh alerts
+    vehicles.forEach((vehicle) => {
+      const state = nextStates[vehicle.id];
+      const name = vehicle.driverName || vehicle.vehicleNumber || "Driver";
+      if (state?.path?.length) {
+        pollTomTomForRoute(vehicle.id, state.path, name);
+      }
+    });
+
+    pushNotif(`✅ All routes optimized for ${vehicles.length} driver${vehicles.length > 1 ? "s" : ""}. ETAs calculated.`, "success");
   };
 
   const analyzeOptimizedRoutes = () => {
-    // Build one routeCoords entry per vehicle using their optimized road path.
-    // src = first point of their path (start location)
-    // dest = last point of their path (final stop)
     const perVehicle = vehicles
       .map((vehicle) => {
         const state = routeStates[vehicle.id];
@@ -1193,6 +1236,31 @@ const [page, setPage] = useState("landing");
     return () => clearInterval(intervalId);
   }, [assignedStopsByVehicle, gpsLocations, isPlaying]);
 
+  // ─── Periodic TomTom congestion re-poll every 2 min while simulation runs ──
+  useEffect(() => {
+    if (!isSimulationStarted || !isPlaying) return undefined;
+    const intervalId = setInterval(() => {
+      vehicles.forEach((vehicle) => {
+        const state = routeStates[vehicle.id];
+        const name = vehicle.driverName || vehicle.vehicleNumber || "Driver";
+        if (state?.path?.length && !state.isCompleted) {
+          pollTomTomForRoute(vehicle.id, state.path, name);
+        }
+      });
+    }, 120000); // 2 minutes
+    return () => clearInterval(intervalId);
+  }, [isSimulationStarted, isPlaying, vehicles, routeStates]);
+
+  // ─── Close notification panel on outside click ─────────────────────────
+  useEffect(() => {
+    if (!notifOpen) return;
+    const handler = (e) => {
+      if (!e.target.closest("[data-notif-panel]")) setNotifOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [notifOpen]);
+
   useEffect(() => {
     if (!isSimulationStarted) return undefined;
 
@@ -1227,51 +1295,246 @@ const [page, setPage] = useState("landing");
     if (!isSimulationStarted) return;
     setIsPlaying((prev) => !prev);
   };
-  const simulateDisruption = () => {
-    if (!isSimulationStarted) return;
 
-    setIsRerouting(true);
+  // ─── Notification helpers ────────────────────────────────────────────────
+  const pushNotif = (msg, type = "info") => {
+    const id = `${Date.now()}-${Math.random()}`;
+    setNotifs(prev => [{ id, msg, type, ts: Date.now(), read: false }, ...prev].slice(0, 50));
+    if (type !== "danger") setTimeout(() => setNotifs(prev => prev.map(n => n.id === id ? {...n, read: true} : n)), 15000);
+    return id;
+  };
+  const markAllRead = () => setNotifs(prev => prev.map(n => ({...n, read: true})));
+  const clearNotif  = (id) => setNotifs(prev => prev.filter(n => n.id !== id));
+  const clearAllNotifs = () => setNotifs([]);
 
-    setAlerts((prev) => [
-      ...prev,
-      "🚨 Accident detected! Re-routing vehicles...",
-    ]);
+  // ─── ETA calculator ────────────────────────────────────────────────────
+  const AVG_SPEED_KMH = 30;
 
-    setRouteStates((prev) => {
-      const updated = {};
+  const calcStopETAs = (vehicleId, roadPath, orderedStopIds, vehicleStops, startMs) => {
+    if (!roadPath || roadPath.length < 2) return [];
+    let totalKm = 0;
+    for (let i = 0; i < roadPath.length - 1; i++) {
+      const [lat1, lng1] = roadPath[i];
+      const [lat2, lng2] = roadPath[i + 1];
+      const dLat = (lat2 - lat1) * 111.32;
+      const dLng = (lng2 - lng1) * 111.32 * Math.cos(lat1 * Math.PI / 180);
+      totalKm += Math.sqrt(dLat * dLat + dLng * dLng);
+    }
+    const totalMins = (totalKm / AVG_SPEED_KMH) * 60;
 
-      Object.entries(prev).forEach(([vehicleId, state]) => {
-        if (!state.path || state.path.length < 5) {
-          updated[vehicleId] = state;
-          return;
+    const results = [];
+    const stopObjects = orderedStopIds
+      .map(id => vehicleStops.find(s => s.id === id))
+      .filter(s => s?.location);
+
+    stopObjects.forEach((stop, idx) => {
+      let minDist = Infinity, nearestIdx = 0;
+      roadPath.forEach(([plat, plng], pi) => {
+        const d = Math.hypot(plat - stop.location.lat, plng - stop.location.lng);
+        if (d < minDist) { minDist = d; nearestIdx = pi; }
+      });
+      const fraction = nearestIdx / (roadPath.length - 1);
+      const etaMins = Math.round(totalMins * fraction);
+      const etaMs = startMs + etaMins * 60 * 1000;
+      let cumKm = 0;
+      for (let i = 0; i < nearestIdx && i < roadPath.length - 1; i++) {
+        const [lat1, lng1] = roadPath[i];
+        const [lat2, lng2] = roadPath[i + 1];
+        const dLat = (lat2 - lat1) * 111.32;
+        const dLng = (lng2 - lng1) * 111.32 * Math.cos(lat1 * Math.PI / 180);
+        cumKm += Math.sqrt(dLat * dLat + dLng * dLng);
+      }
+      results.push({
+        stopId: stop.id,
+        name: stop.name,
+        etaMs,
+        etaMins,
+        distKm: Math.round(cumKm * 10) / 10,
+        order: idx + 1,
+      });
+    });
+    return results;
+  };
+
+  // ─── TomTom congestion poller ───────────────────────────────────────────
+  const pollTomTomForRoute = async (vehicleId, roadPath, driverName) => {
+    if (!roadPath || roadPath.length < 2) return;
+    try {
+      const res = await fetch("/route-traffic-summary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: roadPath, vehicleId, driverName }),
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data.available || data.level === "clear") return;
+
+      const roundedRatio = Math.round((data.avgDelayRatio || 1) * 10);
+      const key = `${vehicleId}-tomtom-${roundedRatio}`;
+
+      setTrafficAlertsFired(prev => {
+        if (prev.has(key)) return prev;
+        const next = new Set(prev);
+        next.add(key);
+
+        if (data.level === "severe") {
+          pushNotif(`🔴 [${driverName}] ${data.message}`, "danger");
+        } else if (data.level === "moderate") {
+          pushNotif(`🟡 [${driverName}] ${data.message}`, "warning");
+        } else if (data.level === "light") {
+          pushNotif(`🟠 [${driverName}] ${data.message}`, "warning");
         }
+        return next;
+      });
+    } catch { /* network errors are silent */ }
+  };
 
-        // current position
-        const currentIndex = state.simIndex;
-        const currentPos = state.path[currentIndex];
+  const simulateDisruptionForDriver = async (vehicleId) => {
+    if (!isSimulationStarted) return;
+    const state = routeStates[vehicleId];
+    const vehicle = vehicles.find((v) => v.id === vehicleId);
+    const name = vehicle?.driverName || vehicle?.vehicleNumber || "Driver";
 
-        const remainingPath = state.path.slice(currentIndex);
-
-        // simple reroute: slightly shift path smoothly
-        const newPath = remainingPath.map(([lat, lng], i) => [
-          lat + 0.002 * i,
-          lng + 0.002 * i,
-        ]);
-
-        updated[vehicleId] = {
-          ...state,
-          path: [currentPos, ...newPath], // new rerouted path
-          simIndex: 0,
-          simPosition: currentPos,
-          heading: 0,
-        };
+    try {
+      const response = await fetch("/simulate-disruption", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          vehicleId,
+          currentPath: state?.path || [],
+          simIndex: state?.simIndex || 0,
+        }),
       });
 
-      return updated;
-    });
+      const data = await response.json();
+      if (!data.success) throw new Error("Disruption failed");
 
-    // stop rerouting indicator after 2 sec
-    setTimeout(() => setIsRerouting(false), 2000);
+      const disruption = data.disruption;
+
+      setDriverDisruptions((prev) => ({ ...prev, [vehicleId]: disruption }));
+      setRerouteResults((prev) => { const n = { ...prev }; delete n[vehicleId]; return n; });
+      setRerouteComparisons((prev) => { const n = { ...prev }; delete n[vehicleId]; return n; });
+
+      pushNotif(`${disruption.icon} [${name}] ${disruption.label} on ${disruption.streetName} — click Re-Route!`, "danger");
+    } catch (err) {
+      console.error("Simulate disruption error:", err);
+      const fallbackDisruption = { type: "accident", icon: "💥", label: "Accident", streetName: "route ahead" };
+      setDriverDisruptions((prev) => ({ ...prev, [vehicleId]: fallbackDisruption }));
+      pushNotif(`💥 [${name}] Accident on route ahead — click Re-Route!`, "danger");
+    }
+  };
+
+  const rerouteDriver = async (vehicleId) => {
+    if (!isSimulationStarted) return;
+    const state = routeStates[vehicleId];
+    if (!state?.path?.length) return;
+
+    const disruption = driverDisruptions[vehicleId];
+    setReroutingDrivers((prev) => ({ ...prev, [vehicleId]: true }));
+    setRerouteComparisons((prev) => ({ ...prev, [vehicleId]: null }));
+
+    try {
+      const currentIndex = state.simIndex || 0;
+      const currentPos = state.path[currentIndex] || state.path[0];
+
+      const vehicleStops = assignedStopsByVehicle[vehicleId] || [];
+      const remainingStops = vehicleStops
+        .filter((stop) => !state.completedStopIds?.includes(stop.id) && stop.location)
+        .map((stop) => ({ id: stop.id, lat: stop.location.lat, lng: stop.location.lng }));
+
+      if (remainingStops.length === 0) {
+        setDriverDisruptions((prev) => { const n = { ...prev }; delete n[vehicleId]; return n; });
+        setReroutingDrivers((prev) => ({ ...prev, [vehicleId]: false }));
+        return;
+      }
+
+      const response = await fetch("/smart-reroute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          currentPosition: { lat: currentPos[0], lng: currentPos[1] },
+          remainingStops,
+          disruption: disruption
+            ? { type: disruption.type, streetName: disruption.streetName }
+            : null,
+        }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Server error ${response.status}: ${errText}`);
+      }
+
+      const data = await response.json();
+      if (!data.success || !data.chosen) throw new Error(data.error || "No route returned");
+
+      const { chosen, candidates } = data;
+
+      setRerouteComparisons((prev) => ({ ...prev, [vehicleId]: candidates }));
+
+      setRouteStates((prev) => ({
+        ...prev,
+        [vehicleId]: {
+          ...prev[vehicleId],
+          path: chosen.path,
+          simIndex: 0,
+          simPosition: chosen.path[0],
+          heading: chosen.path.length > 1 ? calculateBearing(chosen.path[0], chosen.path[1]) : 0,
+          isCompleted: false,
+        },
+      }));
+
+      setRerouteResults((prev) => ({
+        ...prev,
+        [vehicleId]: {
+          distance: chosen.distKm,
+          duration: chosen.durMin,
+          riskLevel: chosen.riskLevel,
+          riskReasons: chosen.riskReasons,
+          totalCandidates: candidates.length,
+        },
+      }));
+
+      setDriverDisruptions((prev) => { const n = { ...prev }; delete n[vehicleId]; return n; });
+
+      const vehicle = vehicles.find((v) => v.id === vehicleId);
+      const name = vehicle?.driverName || vehicle?.vehicleNumber || "Driver";
+      const riskEmoji = chosen.riskLevel === "Low" ? "🟢" : chosen.riskLevel === "Medium" ? "🟡" : "🔴";
+
+      pushNotif(`✅ [${name}] Safest route: ${chosen.distKm}km ~${chosen.durMin}min ${riskEmoji} ${chosen.riskLevel} Risk (${candidates.length} routes analyzed)`, "success");
+
+      setAllRouteCoords((prev) => {
+        const filtered = prev.filter((e) => e.vehicleId !== vehicleId);
+        return [...filtered, {
+          vehicleId,
+          vehicleNumber: vehicle?.vehicleNumber || vehicleId,
+          src: chosen.path[0],
+          dest: chosen.path[chosen.path.length - 1],
+        }];
+      });
+
+      const currentOrderedIds = state?.orderedStopIds || [];
+      const newETAs = calcStopETAs(vehicleId, chosen.path, currentOrderedIds, vehicleStops, Date.now());
+      setStopETAs(prev => ({ ...prev, [vehicleId]: newETAs }));
+
+      const driverName = vehicle?.driverName || vehicle?.vehicleNumber || "Driver";
+      pollTomTomForRoute(vehicleId, chosen.path, driverName);
+
+    } catch (err) {
+      console.error("Smart reroute error:", err);
+      pushNotif(`❌ Rerouting failed: ${err.message}`, "danger");
+    } finally {
+      setReroutingDrivers((prev) => ({ ...prev, [vehicleId]: false }));
+    }
+  };
+
+  const simulateDisruption = () => {
+    if (!isSimulationStarted || vehicles.length === 0) return;
+    const available = vehicles.filter((v) => !driverDisruptions[v.id]);
+    const target = available.length > 0
+      ? available[Math.floor(Math.random() * available.length)]
+      : vehicles[Math.floor(Math.random() * vehicles.length)];
+    simulateDisruptionForDriver(target.id);
   };
   const tileConfig = TILE_OPTIONS[tileTheme];
 
@@ -1406,7 +1669,7 @@ const [page, setPage] = useState("landing");
             </div>
           </div>
 
-          {/* RIGHT VISUAL (REPLACES FLEET CARD) */}
+          {/* RIGHT VISUAL */}
           <div style={{ flex: 1, minWidth: "300px" }}>
             <h3 style={{ marginBottom: "20px" }}>How the System Works</h3>
 
@@ -1470,7 +1733,7 @@ const [page, setPage] = useState("landing");
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "repeat(3, 1fr)", // ✅ 3 per row
+              gridTemplateColumns: "repeat(3, 1fr)",
               gap: "28px",
               maxWidth: "1000px",
               width: "100%",
@@ -1567,7 +1830,7 @@ const [page, setPage] = useState("landing");
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "repeat(4, 1fr)", // ✅ 4 in one row
+              gridTemplateColumns: "repeat(4, 1fr)",
               gap: "24px",
               maxWidth: "1200px",
               margin: "40px auto",
@@ -1602,7 +1865,7 @@ const [page, setPage] = useState("landing");
                   borderRadius: "20px",
                   padding: "28px 20px",
                   border: "1px solid rgba(59,130,246,0.2)",
-                  textAlign: "center", // ✅ center everything
+                  textAlign: "center",
                   transition: "all 0.3s ease",
                   cursor: "pointer",
                 }}
@@ -1616,13 +1879,12 @@ const [page, setPage] = useState("landing");
                   e.currentTarget.style.boxShadow = "none";
                 }}
               >
-                {/* NUMBER (CENTERED) */}
                 <div
                   style={{
                     width: "60px",
                     height: "60px",
                     borderRadius: "50%",
-                    margin: "0 auto 16px", // ✅ centers it
+                    margin: "0 auto 16px",
                     background: "linear-gradient(135deg,#3B82F6,#06B6D4)",
                     display: "flex",
                     alignItems: "center",
@@ -1782,6 +2044,152 @@ const [page, setPage] = useState("landing");
             <span>{activeVehicleCount} active vehicles</span>
           </div>
           <div className="header-actions">
+            {/* ── Bell notification icon ─────────────────────── */}
+            {(() => {
+              const unread = notifs.filter(n => !n.read).length;
+              const hasDanger = notifs.some(n => !n.read && n.type === "danger");
+              return (
+                <div data-notif-panel="1" style={{ position: "relative" }}>
+                  <button
+                    onClick={() => { setNotifOpen(p => !p); markAllRead(); }}
+                    style={{
+                      border: "none",
+                      background: hasDanger ? "#fef2f2" : unread > 0 ? "#eff6ff" : "#f1f5f9",
+                      borderRadius: "50%",
+                      width: 38, height: 38,
+                      cursor: "pointer",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      position: "relative",
+                      boxShadow: hasDanger ? "0 0 0 2px #fca5a5" : unread > 0 ? "0 0 0 2px #bfdbfe" : "none",
+                      transition: "all 200ms",
+                    }}
+                    title="Notifications"
+                  >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={hasDanger ? "#dc2626" : unread > 0 ? "#2563eb" : "#64748b"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+                      <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+                    </svg>
+                    {unread > 0 && (
+                      <span style={{
+                        position: "absolute", top: 2, right: 2,
+                        background: hasDanger ? "#dc2626" : "#2563eb",
+                        color: "white", borderRadius: "999px",
+                        minWidth: 16, height: 16,
+                        fontSize: "0.58rem", fontWeight: 800,
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        padding: "0 3px",
+                        lineHeight: 1,
+                        animation: hasDanger ? "pulse 1s infinite" : "none",
+                        border: "1.5px solid white",
+                      }}>{unread > 9 ? "9+" : unread}</span>
+                    )}
+                  </button>
+
+                  {/* Notification dropdown panel */}
+                  {notifOpen && (
+                    <div data-notif-panel="1" style={{
+                      position: "absolute",
+                      top: 46,
+                      right: 0,
+                      width: 320,
+                      background: "#fff",
+                      border: "1px solid #e2e8f0",
+                      borderRadius: 14,
+                      boxShadow: "0 12px 40px rgba(0,0,0,0.15)",
+                      zIndex: 3000,
+                      overflow: "hidden",
+                      fontFamily: "Outfit, sans-serif",
+                    }}>
+                      {/* Header */}
+                      <div style={{
+                        display: "flex", alignItems: "center", justifyContent: "space-between",
+                        padding: "12px 16px",
+                        borderBottom: "1px solid #f1f5f9",
+                        background: "#f8fafc",
+                      }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <span style={{ fontSize: 16 }}>🔔</span>
+                          <span style={{ fontWeight: 700, fontSize: "0.85rem", color: "#0f172a" }}>
+                            Notifications
+                          </span>
+                          {notifs.length > 0 && (
+                            <span style={{
+                              background: "#e2e8f0", color: "#64748b",
+                              borderRadius: 999, padding: "1px 7px",
+                              fontSize: "0.7rem", fontWeight: 600,
+                            }}>{notifs.length}</span>
+                          )}
+                        </div>
+                        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                          {notifs.length > 0 && (
+                            <button
+                              onClick={clearAllNotifs}
+                              style={{ border: "none", background: "none", fontSize: "0.72rem", color: "#94a3b8", cursor: "pointer" }}
+                            >Clear all</button>
+                          )}
+                          <button
+                            onClick={() => setNotifOpen(false)}
+                            style={{ border: "none", background: "none", fontSize: "1rem", color: "#94a3b8", cursor: "pointer", lineHeight: 1 }}
+                          >✕</button>
+                        </div>
+                      </div>
+
+                      {/* Notification list */}
+                      <div style={{ maxHeight: 380, overflowY: "auto" }}>
+                        {notifs.length === 0 ? (
+                          <div style={{ padding: "28px 16px", textAlign: "center", color: "#94a3b8", fontSize: "0.8rem" }}>
+                            <div style={{ fontSize: 32, marginBottom: 8 }}>🔕</div>
+                            No notifications yet
+                          </div>
+                        ) : (
+                          notifs.map(n => {
+                            const isDanger  = n.type === "danger";
+                            const isSuccess = n.type === "success";
+                            const isWarning = n.type === "warning";
+                            const leftColor = isDanger ? "#dc2626" : isSuccess ? "#16a34a" : isWarning ? "#d97706" : "#3b82f6";
+                            const bg = isDanger ? "#fef2f2" : isSuccess ? "#f0fdf4" : isWarning ? "#fffbeb" : "#f8fafc";
+                            const mins = Math.floor((Date.now() - n.ts) / 60000);
+                            const timeLabel = mins < 1 ? "Just now" : mins < 60 ? `${mins}m ago` : `${Math.floor(mins/60)}h ago`;
+                            return (
+                              <div key={n.id} style={{
+                                display: "flex",
+                                gap: 0,
+                                background: n.read ? "#fff" : bg,
+                                borderBottom: "1px solid #f1f5f9",
+                                position: "relative",
+                                transition: "background 300ms",
+                              }}>
+                                {/* Left colour bar */}
+                                <div style={{ width: 4, background: n.read ? "#e2e8f0" : leftColor, flexShrink: 0 }} />
+                                <div style={{ flex: 1, padding: "10px 12px 8px 10px" }}>
+                                  <div style={{
+                                    fontSize: "0.76rem",
+                                    color: "#1e293b",
+                                    lineHeight: 1.5,
+                                    fontWeight: isDanger && !n.read ? 600 : 400,
+                                  }}>{n.msg}</div>
+                                  <div style={{ fontSize: "0.65rem", color: "#94a3b8", marginTop: 3 }}>{timeLabel}</div>
+                                </div>
+                                <button
+                                  onClick={() => clearNotif(n.id)}
+                                  style={{
+                                    border: "none", background: "none",
+                                    color: "#cbd5e1", fontSize: "0.8rem",
+                                    cursor: "pointer", padding: "8px 10px 0 0",
+                                    alignSelf: "flex-start",
+                                  }}
+                                >✕</button>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
             <button
               className="pill-btn secondary"
               onClick={togglePlayPause}
@@ -1821,76 +2229,330 @@ const [page, setPage] = useState("landing");
                 <div className="grid">
                   {vehicleDisplayStates.map((vehicle, idx) => (
                     <article className="vehicle-card" key={vehicle.id}>
+                      {/* Coloured left stripe */}
                       <span
                         className="vehicle-stripe"
                         style={{ background: vehicle.color }}
                       />
 
-                      <div className="grid mono">
-                        <input
-                          className="text-input"
-                          placeholder="Vehicle number"
-                          value={vehicle.vehicleNumber}
-                          onChange={(e) =>
-                            updateVehicle(
-                              vehicle.id,
-                              "vehicleNumber",
-                              e.target.value,
-                            )
-                          }
-                        />
-                        <input
-                          className="text-input"
-                          placeholder="Driver name"
-                          value={vehicle.driverName}
-                          onChange={(e) =>
-                            updateVehicle(
-                              vehicle.id,
-                              "driverName",
-                              e.target.value,
-                            )
-                          }
-                        />
-                        <GeocodeInput
-                          id={`start-${vehicle.id}`}
-                          label="Start location"
-                          placeholder="Search location"
-                          selectedLocation={vehicle.startLocation}
-                          onSelect={(location) =>
-                            updateVehicle(vehicle.id, "startLocation", location)
-                          }
-                          onClear={() =>
-                            updateVehicle(vehicle.id, "startLocation", null)
-                          }
-                        />
+                      {/* ── All card content in a single vertical column ── */}
+                      <div className="vehicle-body">
+                        {/* Input fields */}
+                        <div className="grid mono">
+                          <input
+                            className="text-input"
+                            placeholder="Vehicle number"
+                            value={vehicle.vehicleNumber}
+                            onChange={(e) =>
+                              updateVehicle(
+                                vehicle.id,
+                                "vehicleNumber",
+                                e.target.value,
+                              )
+                            }
+                          />
+                          <input
+                            className="text-input"
+                            placeholder="Driver name"
+                            value={vehicle.driverName}
+                            onChange={(e) =>
+                              updateVehicle(
+                                vehicle.id,
+                                "driverName",
+                                e.target.value,
+                              )
+                            }
+                          />
+                          <GeocodeInput
+                            id={`start-${vehicle.id}`}
+                            label="Start location"
+                            placeholder="Search location"
+                            selectedLocation={vehicle.startLocation}
+                            onSelect={(location) =>
+                              updateVehicle(vehicle.id, "startLocation", location)
+                            }
+                            onClear={() =>
+                              updateVehicle(vehicle.id, "startLocation", null)
+                            }
+                          />
 
-                        <span
-                          className={`gps-indicator ${vehicle.gpsLive ? "live" : "simulated"}`}
-                        >
-                          <span className="gps-dot" />
-                          <span>
-                            {vehicle.gpsLive ? "Live GPS" : "Simulated"}
+                          <span
+                            className={`gps-indicator ${vehicle.gpsLive ? "live" : "simulated"}`}
+                          >
+                            <span className="gps-dot" />
+                            <span>
+                              {vehicle.gpsLive ? "Live GPS" : "Simulated"}
+                            </span>
                           </span>
-                        </span>
-                      </div>
+                        </div>
 
-                      <div className="vehicle-actions">
-                        <button
-                          className="pill-btn secondary"
-                          onClick={() => copyTrackingLink(vehicle.id)}
-                        >
-                          {vehicle.copiedUntil > Date.now()
-                            ? "Copied!"
-                            : "Copy Tracking Link"}
-                        </button>
-                        <button
-                          className="pill-btn danger"
-                          disabled={vehicles.length === 1}
-                          onClick={() => removeVehicle(vehicle.id)}
-                        >
-                          Remove
-                        </button>
-                      </div>
+                        {/* ── Stop ETA Timeline — sits between fields and buttons ── */}
+                        {isSimulationStarted && stopETAs[vehicle.id]?.length > 0 && (() => {
+                          const etas = stopETAs[vehicle.id];
+                          const startTime = new Date();
+                          const fmtTime = (ms) => {
+                            const d = new Date(ms);
+                            return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+                          };
+                          const state = routeStates[vehicle.id];
+                          return (
+                            <div style={{
+                              background: "#f8fafc",
+                              border: "1px solid #e2e8f0",
+                              borderRadius: 10,
+                              padding: "8px 10px",
+                              fontSize: "0.7rem",
+                            }}>
+                              <div style={{ fontWeight: 700, color: "#0f172a", marginBottom: 6, display: "flex", alignItems: "center", gap: 5 }}>
+                                🕐 Stop Schedule
+                                <span style={{ fontWeight: 400, color: "#94a3b8", fontSize: "0.63rem" }}>
+                                  Depart {startTime.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                                </span>
+                              </div>
+                              {etas.map((eta, i) => {
+                                const done = state?.completedStopIds?.includes(eta.stopId);
+                                const isNext = !done && etas.slice(0, i).every(e => state?.completedStopIds?.includes(e.stopId));
+                                return (
+                                  <div key={eta.stopId} style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 6,
+                                    padding: "4px 0",
+                                    borderBottom: i < etas.length - 1 ? "1px solid #f1f5f9" : "none",
+                                    opacity: done ? 0.5 : 1,
+                                  }}>
+                                    {/* Timeline dot */}
+                                    <div style={{
+                                      width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+                                      background: done ? "#22c55e" : isNext ? "#f59e0b" : "#cbd5e1",
+                                      border: isNext ? "2px solid #f59e0b" : done ? "2px solid #22c55e" : "2px solid #cbd5e1",
+                                      boxShadow: isNext ? "0 0 0 3px rgba(245,158,11,0.2)" : "none",
+                                    }} />
+                                    <div style={{ flex: 1, overflow: "hidden" }}>
+                                      <div style={{
+                                        fontWeight: isNext ? 700 : 500,
+                                        color: done ? "#94a3b8" : "#1e293b",
+                                        whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                                        textDecoration: done ? "line-through" : "none",
+                                      }}>
+                                        {eta.order}. {eta.name}
+                                      </div>
+                                      <div style={{ color: "#94a3b8", fontSize: "0.62rem" }}>
+                                        {eta.distKm} km from start
+                                      </div>
+                                    </div>
+                                    <div style={{
+                                      textAlign: "right",
+                                      fontVariantNumeric: "tabular-nums",
+                                    }}>
+                                      <div style={{
+                                        fontWeight: 700,
+                                        color: done ? "#94a3b8" : isNext ? "#f59e0b" : "#0f172a",
+                                        fontSize: "0.72rem",
+                                      }}>
+                                        {done ? "✓ Done" : fmtTime(eta.etaMs)}
+                                      </div>
+                                      {!done && (
+                                        <div style={{ color: "#94a3b8", fontSize: "0.6rem" }}>
+                                          ~{eta.etaMins} min
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          );
+                        })()}
+
+                        {/* ── Action buttons ── */}
+                        <div className="vehicle-actions">
+                          <button
+                            className="pill-btn secondary"
+                            onClick={() => copyTrackingLink(vehicle.id)}
+                          >
+                            {vehicle.copiedUntil > Date.now()
+                              ? "Copied!"
+                              : "Copy Tracking Link"}
+                          </button>
+                          <button
+                            className="pill-btn danger"
+                            disabled={vehicles.length === 1}
+                            onClick={() => removeVehicle(vehicle.id)}
+                          >
+                            Remove
+                          </button>
+
+                          {/* Per-driver disruption simulation & re-routing */}
+                          {isSimulationStarted && (
+                            <div style={{ width: "100%", display: "grid", gap: "6px" }}>
+
+                              {/* Disruption alert banner */}
+                              {driverDisruptions[vehicle.id] && (
+                                <div style={{
+                                  background: "#fef2f2",
+                                  border: "1px solid #fca5a5",
+                                  borderRadius: "8px",
+                                  padding: "8px 10px",
+                                  fontSize: "0.68rem",
+                                  color: "#991b1b",
+                                  lineHeight: 1.5,
+                                }}>
+                                  <div style={{ fontWeight: 700, marginBottom: 2 }}>
+                                    {driverDisruptions[vehicle.id].icon} {driverDisruptions[vehicle.id].label}
+                                  </div>
+                                  <div style={{ color: "#b91c1c" }}>
+                                    📍 Blocked: <strong>{driverDisruptions[vehicle.id].streetName}</strong>
+                                  </div>
+                                  <div style={{ color: "#dc2626", marginTop: 2, fontSize: "0.62rem" }}>
+                                    Route ahead is impassable — re-route required
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Rerouting in progress */}
+                              {reroutingDrivers[vehicle.id] && (
+                                <div style={{
+                                  background: "#eff6ff",
+                                  border: "1px solid #bfdbfe",
+                                  borderRadius: "8px",
+                                  padding: "7px 10px",
+                                  fontSize: "0.68rem",
+                                  color: "#1d4ed8",
+                                  lineHeight: 1.5,
+                                }}>
+                                  <div style={{ fontWeight: 700, marginBottom: 3 }}>🔍 Analyzing candidate routes...</div>
+                                  <div style={{ color: "#3b82f6" }}>Fetching routes → scoring risk → picking safest</div>
+                                </div>
+                              )}
+
+                              {/* Route comparison panel */}
+                              {rerouteComparisons[vehicle.id] && !reroutingDrivers[vehicle.id] && !driverDisruptions[vehicle.id] && (
+                                <div style={{
+                                  background: "#f8fafc",
+                                  border: "1px solid #e2e8f0",
+                                  borderRadius: "8px",
+                                  padding: "7px 8px",
+                                  fontSize: "0.64rem",
+                                }}>
+                                  <div style={{ fontWeight: 700, marginBottom: 5, fontSize: "0.68rem", color: "#0f172a" }}>
+                                    📊 Route options analyzed:
+                                  </div>
+                                  {rerouteComparisons[vehicle.id].map((c, i) => {
+                                    const riskColor = c.riskLevel === "Low" ? "#15803d" : c.riskLevel === "Medium" ? "#b45309" : "#991b1b";
+                                    const riskBg = c.riskLevel === "Low" ? "#ecfdf3" : c.riskLevel === "Medium" ? "#fffbeb" : "#fef2f2";
+                                    const emoji = c.riskLevel === "Low" ? "🟢" : c.riskLevel === "Medium" ? "🟡" : "🔴";
+                                    const isWinner = i === 0;
+                                    return (
+                                      <div key={i} style={{
+                                        display: "flex",
+                                        alignItems: "center",
+                                        gap: "5px",
+                                        padding: "4px 5px",
+                                        marginBottom: "3px",
+                                        borderRadius: "6px",
+                                        background: isWinner ? riskBg : "transparent",
+                                        border: isWinner ? `1px solid ${riskColor}40` : "1px solid transparent",
+                                      }}>
+                                        <span style={{ minWidth: 14, fontWeight: 700, color: isWinner ? riskColor : "#94a3b8" }}>
+                                          {isWinner ? "✓" : `${i + 1}.`}
+                                        </span>
+                                        <span style={{ flex: 1, color: "#334155" }}>
+                                          {c.distKm}km · ~{c.durMin}min
+                                        </span>
+                                        <span style={{
+                                          background: riskBg,
+                                          color: riskColor,
+                                          borderRadius: "999px",
+                                          padding: "1px 6px",
+                                          fontWeight: 600,
+                                          fontSize: "0.6rem",
+                                        }}>
+                                          {emoji} {c.riskLevel}
+                                        </span>
+                                        {isWinner && (
+                                          <span style={{ color: riskColor, fontSize: "0.6rem", fontWeight: 700 }}>← selected</span>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+
+                              {/* Final success badge */}
+                              {rerouteResults[vehicle.id] && !driverDisruptions[vehicle.id] && !reroutingDrivers[vehicle.id] && (
+                                <div style={{
+                                  background: "#ecfdf3",
+                                  border: "1px solid #86efac",
+                                  borderRadius: "8px",
+                                  padding: "5px 8px",
+                                  fontSize: "0.66rem",
+                                  color: "#15803d",
+                                  display: "flex",
+                                  justifyContent: "space-between",
+                                  alignItems: "center",
+                                }}>
+                                  <span>✅ Active: {rerouteResults[vehicle.id].distance}km · ~{rerouteResults[vehicle.id].duration}min</span>
+                                  <span style={{
+                                    fontWeight: 700,
+                                    background: rerouteResults[vehicle.id].riskLevel === "Low" ? "#dcfce7"
+                                      : rerouteResults[vehicle.id].riskLevel === "Medium" ? "#fef9c3" : "#fee2e2",
+                                    color: rerouteResults[vehicle.id].riskLevel === "Low" ? "#15803d"
+                                      : rerouteResults[vehicle.id].riskLevel === "Medium" ? "#b45309" : "#991b1b",
+                                    borderRadius: "999px",
+                                    padding: "1px 6px",
+                                    fontSize: "0.6rem",
+                                  }}>
+                                    {rerouteResults[vehicle.id].riskLevel === "Low" ? "🟢" : rerouteResults[vehicle.id].riskLevel === "Medium" ? "🟡" : "🔴"} {rerouteResults[vehicle.id].riskLevel} Risk
+                                  </span>
+                                </div>
+                              )}
+
+                              <div style={{ display: "flex", gap: "6px" }}>
+                                {/* SIMULATE button */}
+                                <button
+                                  className="pill-btn"
+                                  style={{
+                                    flex: 1,
+                                    background: (driverDisruptions[vehicle.id] || reroutingDrivers[vehicle.id]) ? "#e5e7eb" : "#7c3aed",
+                                    color: (driverDisruptions[vehicle.id] || reroutingDrivers[vehicle.id]) ? "#9ca3af" : "#fff",
+                                    fontSize: "0.68rem",
+                                    padding: "7px 6px",
+                                    cursor: (driverDisruptions[vehicle.id] || reroutingDrivers[vehicle.id]) ? "not-allowed" : "pointer",
+                                  }}
+                                  disabled={!!driverDisruptions[vehicle.id] || reroutingDrivers[vehicle.id]}
+                                  onClick={() => simulateDisruptionForDriver(vehicle.id)}
+                                >
+                                  🚨 Simulate
+                                </button>
+
+                                {/* RE-ROUTE button */}
+                                <button
+                                  className="pill-btn"
+                                  style={{
+                                    flex: 1,
+                                    background: reroutingDrivers[vehicle.id]
+                                      ? "#d1d5db"
+                                      : driverDisruptions[vehicle.id]
+                                      ? "#15803d"
+                                      : "#e5e7eb",
+                                    color: (!driverDisruptions[vehicle.id] && !reroutingDrivers[vehicle.id])
+                                      ? "#9ca3af" : "#fff",
+                                    fontSize: "0.68rem",
+                                    padding: "7px 6px",
+                                    cursor: driverDisruptions[vehicle.id] && !reroutingDrivers[vehicle.id]
+                                      ? "pointer" : "not-allowed",
+                                  }}
+                                  disabled={!driverDisruptions[vehicle.id] || reroutingDrivers[vehicle.id]}
+                                  onClick={() => rerouteDriver(vehicle.id)}
+                                >
+                                  {reroutingDrivers[vehicle.id] ? "⏳ Analyzing..." : "🔄 Re-Route"}
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>{/* end vehicle-body */}
                     </article>
                   ))}
                 </div>
@@ -2089,31 +2751,6 @@ const [page, setPage] = useState("landing");
             <div
               className={`map-panel ${tileTheme === "dark" ? "theme-dark" : ""}`}
             >
-              <div
-                style={{
-                  position: "absolute",
-                  top: 80,
-                  right: 20,
-                  zIndex: 2000,
-                  width: "250px",
-                }}
-              >
-                {alerts.map((alert, i) => (
-                  <div
-                    key={i}
-                    style={{
-                      background: "#fee2e2",
-                      color: "#991b1b",
-                      padding: "10px",
-                      marginBottom: "8px",
-                      borderRadius: "8px",
-                      fontSize: "0.8rem",
-                    }}
-                  >
-                    {alert}
-                  </div>
-                ))}
-              </div>
               <div className="tile-switcher mono">
                 {Object.entries(TILE_OPTIONS).map(([key, option]) => (
                   <button
@@ -2175,8 +2812,6 @@ const [page, setPage] = useState("landing");
 
                 <FitMapBounds routeStates={routeStates} fitToken={fitToken} />
 
-                {/* Route planner overlay — must live inside MapContainer */}
-                {/* Per-vehicle risk overlays — one MapView per vehicle, each on their optimized path */}
                 {allRouteCoords.map((entry) => (
                   <MapView
                     key={`analysis-${entry.vehicleId}`}
@@ -2317,6 +2952,71 @@ const [page, setPage] = useState("landing");
                     </Marker>
                   );
                 })}
+
+                {/* Disruption markers */}
+                {vehicles.map((vehicle) => {
+                  const disruption = driverDisruptions[vehicle.id];
+                  if (!disruption?.disruptionLat || !disruption?.disruptionLng) return null;
+                  const markerIcon = L.divIcon({
+                    className: "",
+                    html: `
+                      <div style="
+                        position:relative;
+                        display:flex;
+                        flex-direction:column;
+                        align-items:center;
+                      ">
+                        <div style="
+                          background:#dc2626;
+                          color:white;
+                          border-radius:8px;
+                          padding:4px 7px;
+                          font-size:11px;
+                          font-weight:700;
+                          white-space:nowrap;
+                          box-shadow:0 2px 8px rgba(0,0,0,0.35);
+                          border:2px solid white;
+                          max-width:160px;
+                          overflow:hidden;
+                          text-overflow:ellipsis;
+                        ">${disruption.icon} ${disruption.label}</div>
+                        <div style="
+                          background:#dc2626;
+                          width:24px;height:24px;
+                          border-radius:50%;
+                          border:3px solid white;
+                          box-shadow:0 0 0 3px #dc2626, 0 0 0 6px rgba(220,38,38,0.3);
+                          margin-top:3px;
+                          animation:disruptionPulse 1s infinite;
+                        "></div>
+                        <style>
+                          @keyframes disruptionPulse {
+                            0%{box-shadow:0 0 0 3px #dc2626,0 0 0 6px rgba(220,38,38,0.3);}
+                            50%{box-shadow:0 0 0 3px #dc2626,0 0 0 12px rgba(220,38,38,0);}
+                            100%{box-shadow:0 0 0 3px #dc2626,0 0 0 6px rgba(220,38,38,0.3);}
+                          }
+                        </style>
+                      </div>`,
+                    iconSize: [160, 54],
+                    iconAnchor: [80, 54],
+                  });
+                  return (
+                    <Marker
+                      key={`disruption-${vehicle.id}`}
+                      position={[disruption.disruptionLat, disruption.disruptionLng]}
+                      icon={markerIcon}
+                    >
+                      <Popup>
+                        <div style={{ fontSize: "0.8rem", lineHeight: 1.5 }}>
+                          <strong>{disruption.icon} {disruption.label}</strong><br />
+                          📍 <strong>{disruption.streetName}</strong><br />
+                          <span style={{ color: "#dc2626" }}>⛔ Road blocked — re-route required</span>
+                        </div>
+                      </Popup>
+                    </Marker>
+                  );
+                })}
+
               </MapContainer>
             </div>
           </main>
