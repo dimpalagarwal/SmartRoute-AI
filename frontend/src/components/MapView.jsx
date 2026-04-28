@@ -95,7 +95,7 @@ function MapView({ routeCoords, vehicleColor, vehicleNumber, onHoverChange }) {
           points.map(([lat, lon]) =>
             axios
               .get(
-                `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&appid=4473613b70aa7c0e9f28baa5a5889ffe&units=metric`
+                `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&appid=${import.meta.env.VITE_WEATHER_API_KEY}&units=metric`
               )
               .catch(() => null)
           )
