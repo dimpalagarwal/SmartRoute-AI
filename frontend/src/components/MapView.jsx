@@ -1,7 +1,7 @@
 import { Polyline } from "react-leaflet";
 import { useEffect, useState } from "react";
 import axios from "axios";
-import "../utils/fixLeafletIcon";
+import "./fixLeafletIcon";
 
 // MapView renders ONLY Polyline overlays — no MapContainer.
 // Must be placed INSIDE an existing <MapContainer> in App.jsx.
