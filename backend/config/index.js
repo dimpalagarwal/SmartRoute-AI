@@ -11,12 +11,12 @@ module.exports = {
   TOMTOM_API_KEY:      process.env.TOMTOM_API_KEY,
   GOOGLE_API_KEY:      process.env.GOOGLE_API_KEY,
   OPENWEATHER_API_KEY: process.env.OPENWEATHER_API_KEY || "4473613b70aa7c0e9f28baa5a5889ffe",
-  VITE_FRONTEND_URL,
-  VITE_BACKEND_URL,
+  FRONTEND,
+  BACKEND,
   // CORS accepts both the frontend origin and the backend itself
   ALLOWED_ORIGINS: [
-   VITE_FRONTEND_URL,
-    VITE_BACKEND_URL,
+    FRONTEND,
+    BACKEND,
     "http://localhost:5173",
     "http://localhost:5001",
   ].filter((v, i, a) => a.indexOf(v) === i), // deduplicate
