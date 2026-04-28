@@ -1,5 +1,5 @@
 const express = require("express");
-const { PORT } = require("./config");
+const PORT = process.env.PORT || 5001;
 const { corsMiddleware, corsPreFlight } = require("./middleware/cors");
 
 // Route modules
