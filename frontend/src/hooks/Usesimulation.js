@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { api } from "../config";
 import { calculateBearing, distanceDeg } from "../utils/helpers";
 import { GPS_POLL_MS, GPS_FRESHNESS_MS } from "../constants";
 
@@ -87,7 +88,7 @@ export function useSimulation({ assignedStopsByVehicle, vehicles }) {
     if (!isSimulationStarted) return undefined;
     const poll = async () => {
       try {
-        const response = await fetch("/vehicle-locations");
+        const response = await fetch(api("/vehicle-locations"));
         if (!response.ok) return;
         const data = await response.json();
         setGpsLocations(data || {});

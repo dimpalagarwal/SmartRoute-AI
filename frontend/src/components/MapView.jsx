@@ -2,6 +2,7 @@ import { Polyline } from "react-leaflet";
 import { useEffect, useState } from "react";
 import axios from "axios";
 import "./fixLeafletIcon";
+import { api } from "../config";
 
 // MapView renders ONLY Polyline overlays — no MapContainer.
 // Must be placed INSIDE an existing <MapContainer> in App.jsx.
@@ -227,7 +228,7 @@ function MapView({ routeCoords, vehicleColor, vehicleNumber, onHoverChange }) {
   }
 
   try {
-    const res = await axios.post("http://localhost:5001/ai-risk", {
+    const res = await axios.post(api("/ai-risk"), {
       traffic: traffic
         ? {
             currentSpeed: traffic.currentSpeed,

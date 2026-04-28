@@ -20,6 +20,7 @@ import LandingPage from "./components/LandingPage";
 import MapPanel from "./components/MapPanel";
 import NotificationPanel from "./components/NotificationPanel";
 import { FleetTab, DeliveriesTab, AnalyticsTab } from "./components/SidebarTabs";
+import { api } from "./config";
 
 // ── Default stops ─────────────────────────────────────────────────────────────
 const makeDefaultStops = () => [
@@ -160,7 +161,7 @@ export default function App() {
           return;
         }
 
-        const optimizeResponse = await fetch("/optimize-route", {
+        const optimizeResponse = await fetch(api("/optimize-route"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),

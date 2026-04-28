@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { createId } from "../utils/helpers";
 import { VEHICLE_COLORS, MAX_VEHICLES } from "../constants";
+import { frontendUrl } from "../config";
 
 const DEFAULT_VEHICLES = [
   {
@@ -71,7 +72,7 @@ export function useVehicles(setRouteStates, setStops) {
   };
 
   const copyTrackingLink = async (vehicleId) => {
-    const link = `http://localhost:5001/driver/${vehicleId}`;
+    const link = frontendUrl(`/driver/${vehicleId}`);
     try {
       await navigator.clipboard.writeText(link);
       const expires = Date.now() + 2000;

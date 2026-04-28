@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { api } from "../config";
 import { calculateBearing, calcStopETAs } from "../utils/helpers";
 
 /**
@@ -26,7 +27,7 @@ export function useDisruptions({
   const pollTomTomForRoute = async (vehicleId, roadPath, driverName) => {
     if (!roadPath || roadPath.length < 2) return;
     try {
-      const res = await fetch("/route-traffic-summary", {
+      const res = await fetch(api("/route-traffic-summary"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path: roadPath, vehicleId, driverName }),
@@ -73,7 +74,7 @@ export function useDisruptions({
     const name = vehicle?.driverName || vehicle?.vehicleNumber || "Driver";
 
     try {
-      const response = await fetch("/simulate-disruption", {
+      const response = await fetch(api("/simulate-disruption"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -127,7 +128,7 @@ export function useDisruptions({
         return;
       }
 
-      const response = await fetch("/smart-reroute", {
+      const response = await fetch(api("/smart-reroute"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
