@@ -97,7 +97,7 @@ function MapView({ routeCoords, vehicleColor, vehicleNumber, onHoverChange }) {
           points.map(([lat, lon]) =>
             axios
               .get(
-                `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&appid=${import.meta.env.VITE_WEATHER_API_KEY}&units=metric`
+                `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&appid=${import.meta.env.OPENWEATHER_API_KEY}&units=metric`
               )
               .catch(() => null)
           )
@@ -342,11 +342,11 @@ function MapView({ routeCoords, vehicleColor, vehicleNumber, onHoverChange }) {
                     };
 
                     // If we don't have sampled weather, try fetching current weather for the hovered point
-                    if (!weather && import.meta.env.VITE_WEATHER_API_KEY) {
+                    if (!weather && import.meta.env.OPENWEATHER_API_KEY) {
                       (async () => {
                         try {
                           const r = await axios.get(
-                            `https://api.openweathermap.org/data/2.5/weather?lat=${e.latlng.lat}&lon=${e.latlng.lng}&appid=${import.meta.env.VITE_WEATHER_API_KEY}&units=metric`
+                            `https://api.openweathermap.org/data/2.5/weather?lat=${e.latlng.lat}&lon=${e.latlng.lng}&appid=${import.meta.env.OPENWEATHER_API_KEY}&units=metric`
                           );
                           const w = { temp: r.data.main.temp, condition: r.data.weather[0].main };
                           doHover(w);
